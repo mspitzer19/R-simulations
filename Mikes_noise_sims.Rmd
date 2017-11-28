@@ -1,0 +1,226 @@
+This is what we did with Mike and Dave in the stats class:
+I wil first write a normal script, than put this in a function to later simulate many scripts
+```{r}
+library(tidyverse)
+library(data.table)
+library(mvtnorm) # multivariate normal and t distributions
+library(dtplyr) # lets plyr and data.table play nicely
+
+library(doParallel)
+library(plyr)
+registerDoParallel(cores=2)
+# gen_synth_dataset <- function(n_subjects, n_items, n_repetitions, intecept, effect_size,
+# 							  subject_ranef_cov, item_ranef_cov){
+
+	# Make vectors of what things can be 
+n_subjects = 10 
+n_items = 5
+n_repetitions = 5 
+intercept=500 
+effect_size = 0
+items <- 1:n_items
+subjects <- 1:n_subjects
+conditions <- 1:2
+reps <- 1:n_repetitions
+intercept = 500
+subject_ranef_cov = 2
+item_ranef_cov = 2
+subject_noise = 0.3
+item_noise = 0.3
+error_noise = 0.3
+	# all possible combinations
+d <- expand.grid(item=items, subject=subjects, cond=conditions, rep=reps) %>% as.data.table()
+
+d[,trial:=1:.N, by="subject"]
+d[,fixef_intercept:=intercept][,fixef_beta:=effect_size]
+d
+```
+
+
+
+```{r}
+subj_ranefs <- rmvnorm(n_subjects, mean = rep(0, 2), sigma=diag(subject_ranef_cov) * subject_noise) %>% as.data.table()
+setnames(subj_ranefs, c("subj_intercept", "subj_beta"))
+subj_ranefs[,subject:=as.integer(rownames(subj_ranefs))]
+mean(subj_ranefs$subj_intercept)
+
+#now item random effects
+item_ranefs <- rmvnorm(n_items, mean = rep(0, 2), sigma=diag(item_ranef_cov)* item_noise)  %>% as.data.table()
+setnames(item_ranefs, c("item_intercept", "item_beta"))
+item_ranefs[,item:=as.integer(rownames(item_ranefs))]
+d <- left_join(d, subj_ranefs, by="subject")
+d <- left_join(d, item_ranefs, by="item")
+
+d[,combined_intercept:=fixef_intercept + subj_intercept + item_intercept]
+d[,combined_beta:=fixef_beta + subj_beta + item_beta]
+d[,x:=ifelse(cond==1, -0.5, 0.5)]
+d[,error:=rnorm(nrow(d), sd = error_noise)]
+d[,y:=combined_intercept + combined_beta * x + error]
+```
+
+Now that we have a dataset `d` with y as outcome data and x as two conditions A and B for predictors.
+Remember, we set the effect size, so the difference between the two conditions to be 0 (effect size = fixed_beta). All we added to the fixed beta was different noise (from a gaussion with mean 0 and SD 0.3) for each subject for the beta and the intercept. Additionally, we added noise to the one item for its beta and intercept.
+```{r}
+
+m <- lm(y ~ x, data = d)
+s <- summary(m) %>% coef %>% as.data.table
+s[2,]
+```
+
+So this was one dataset d with one linear regression model y = intercept + beta * x + error.
+However, we set a total of 3 noise parameter to a fix value, and it was only one dataset, giving us one p value. But we want many p values to look at a whole p value distribution!
+
+So lets simulate many datasets.
+So we put the upper code in two functions. One to generate datasets, one to generate linear regression models.
+First, we keep the 3 noise values as they are. 
+
+To build the first function all we do is copy and past ethe code from above, and add one line on top of the code.
+```{r}
+gen_synth_dataset <- function(n_subjects, n_items, n_repetitions, intercept, effect_size,
+ 							  subject_ranef_cov, item_ranef_cov, subject_noise, item_noise, error_noise){
+  items <- 1:n_items
+  subjects <- 1:n_subjects
+  conditions <- 1:2
+  reps <- 1:n_repetitions
+  d <- expand.grid(item=items, subject=subjects, cond=conditions, rep=reps) %>% as.data.table()
+  d[,trial:=1:.N, by="subject"]
+  d[,fixef_intercept:=intercept][,fixef_beta:=effect_size]
+  #subject random effects
+  subj_ranefs <- rmvnorm(n_subjects, mean = rep(0, 2), sigma=diag(subject_ranef_cov) * subject_noise) %>% as.data.table()
+  setnames(subj_ranefs, c("subj_intercept", "subj_beta"))
+  subj_ranefs[,subject:=as.integer(rownames(subj_ranefs))]
+  mean(subj_ranefs$subj_intercept)
+  #now item random effects
+  item_ranefs <- rmvnorm(n_items, mean = rep(0, 2), sigma=diag(item_ranef_cov)* item_noise)  %>% as.data.table()
+  setnames(item_ranefs, c("item_intercept", "item_beta"))
+  item_ranefs[,item:=as.integer(rownames(item_ranefs))]
+  d <- left_join(d, subj_ranefs, by="subject")
+  d <- left_join(d, item_ranefs, by="item")
+  #combine everything
+  d[,combined_intercept:=fixef_intercept + subj_intercept + item_intercept]
+  d[,combined_beta:=fixef_beta + subj_beta + item_beta]
+  d[,x:=ifelse(cond==1, -0.5, 0.5)]
+  d[,error:=rnorm(nrow(d), sd = error_noise)]
+  d[,y:=combined_intercept + combined_beta * x + error]
+
+  return(d)
+}
+```
+
+This function takes in the data set generation function and a list of parameters. Then it does a simple linear regression and returns the output. (The do.call command the parameter list will be put into the dataset generating function.)
+
+
+Now we add the parameter list to generate the dataset.
+```{r}
+run_fixef_regression <- function(datagen_fun, param_list){
+  d <- do.call(datagen_fun, param_list)
+  m <- lm(y ~ x, data = d)
+  s <- broom::tidy(m)
+  return(s[-1,])
+}
+```
+
+
+What we do now is simulate the LM of 500 different datasets to receive a p value distribution and the power for a fixed set of noise parameters. We do this 32 times and increase the subject noise by val* 0.15 and the item noise by val 0.03. Then we plot the power of the 32 runs
+```{r}
+# power! 
+library(doParallel)
+registerDoParallel(cores=6)
+runs = c(0:31)
+P5 = matrix(0,32,3)
+
+for (val in runs) {
+  param_list <- list(n_subjects = 30, n_items = 5, n_repetitions = 5, intercept=500, effect_size = 0 ,subject_ranef_cov=2, item_ranef_cov=2, subject_noise = 0.0001 + val*0.15, item_noise = 0.00001 + val*0.03, error_noise = 1.0) #Markus: subject_ranef_cov & item_ranef_cov =2 indicates the amount of n_items *2 
+  nSims <- 500
+  fx <- ldply(1:nSims, function(x) run_fixef_regression(gen_synth_dataset, param_list), .parallel=TRUE) %>% as.data.table
+  mean(fx$p.value<=0.05) # power
+  mean(fx$statistic < -2) # type S error
+  mean(fx$estimate) # average beta estimate across sims
+  P5[val,1] =  mean(fx$p.value<=0.05)
+  P5[val,2] =  mean(fx$statistic < -2)
+  P5[val,3] =  mean(fx$estimate)
+}
+```
+
+Plot power from simulation
+```{r}
+
+plot(runs, P5[,1]) # subject_noise = val*0.1, item_noise = val*0.1, error_noise = val*0.1
+SAVE_P5= P5  
+```
+```{r}
+# power! 
+library(doParallel)
+registerDoParallel(cores=6)
+runs = c(0:31)
+P5 = matrix(0,32,3)
+
+for (val in runs) {
+  param_list <- list(n_subjects = 30, n_items = 50, n_repetitions = 5, intercept=500, effect_size = 0 ,subject_ranef_cov=2, item_ranef_cov=2, subject_noise = 0.0001 + val*0.15, item_noise = 0.00001 + val*0.03, error_noise = 1.0) #Markus: subject_ranef_cov & item_ranef_cov =2 indicates the amount of n_items *2 
+  nSims <- 500
+  fx <- ldply(1:nSims, function(x) run_fixef_regression(gen_synth_dataset, param_list), .parallel=TRUE) %>% as.data.table
+  mean(fx$p.value<=0.05) # power
+  mean(fx$statistic < -2) # type S error
+  mean(fx$estimate) # average beta estimate across sims
+  P5[val,1] =  mean(fx$p.value<=0.05)
+  P5[val,2] =  mean(fx$statistic < -2)
+  P5[val,3] =  mean(fx$estimate)
+}
+```
+
+```{r}
+plot(runs, P5[,1])
+```
+
+
+This is kind of funny, the more items the higher the power in general. 5 items leads to power =0.60. 50 items leads to power = 0.80
+
+Any thoughts?
+
+
+```{r}
+# power! 
+library(doParallel)
+registerDoParallel(cores=4)
+runs = c(0:31)
+P = matrix(0,32,3)
+
+for (val in runs) {
+  param_list <- list(n_subjects = 30, n_items = 5, n_repetitions = 50, intercept=500, effect_size = 0 ,subject_ranef_cov=2, item_ranef_cov=2, subject_noise = 0.0001 + val*0.15, item_noise = 0.00001 + val*0.03, error_noise = 1.0) #Markus: subject_ranef_cov & item_ranef_cov =2 indicates the amount of n_items *2 
+  nSims <- 500
+  fx <- ldply(1:nSims, function(x) run_fixef_regression(gen_synth_dataset, param_list), .parallel=TRUE) %>% as.data.table
+  mean(fx$p.value<=0.05) # power
+  mean(fx$statistic < -2) # type S error
+  mean(fx$estimate) # average beta estimate across sims
+  P[val,1] =  mean(fx$p.value<=0.05)
+  P[val,2] =  mean(fx$statistic < -2)
+  P[val,3] =  mean(fx$estimate)
+}
+```
+
+```{r}
+plot(runs, P[,1])
+```
+```{r}
+# power! 
+library(doParallel)
+registerDoParallel(cores=2)
+runs = c(0:10)
+P = matrix(0,11,3)
+
+for (val in runs) {
+  param_list <- list(n_subjects = 30, n_items = 50, n_repetitions = 50, intercept=500, effect_size = 0 ,subject_ranef_cov=2, item_ranef_cov=2, subject_noise = 0.0001 + val*0.15, item_noise = 0.00001 + val*0.03, error_noise = 1.0) #Markus: subject_ranef_cov & item_ranef_cov =2 indicates the amount of n_items *2 
+  nSims <- 500
+  fx <- ldply(1:nSims, function(x) run_fixef_regression(gen_synth_dataset, param_list), .parallel=TRUE) %>% as.data.table
+  mean(fx$p.value<=0.05) # power
+  mean(fx$statistic < -2) # type S error
+  mean(fx$estimate) # average beta estimate across sims
+  P[val,1] =  mean(fx$p.value<=0.05)
+  P[val,2] =  mean(fx$statistic < -2)
+  P[val,3] =  mean(fx$estimate)
+}
+```
+
+```{r}
+plot(runs, P[,1])
+```
