@@ -5,3 +5,5 @@ This is what I did so far. It is pretty much the same that was in Mike's tutoria
 This is from my machine
 
 Huhu.. this comes fom R Studio :-)
+
+Yeah
